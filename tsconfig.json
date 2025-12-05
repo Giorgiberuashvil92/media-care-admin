@@ -21,6 +21,9 @@
         "name": "next"
       }
     ],
+    "types": [
+      "@types/node"
+    ],
     "paths": {
       "@/*": [
         "./src/*"
