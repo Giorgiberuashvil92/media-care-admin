@@ -1,5 +1,8 @@
 // API Service for Medicare Admin Panel
 // Use production API by default; override via NEXT_PUBLIC_API_URL if needed
+// const API_BASE_URL =
+//   process.env.NEXT_PUBLIC_API_URL || 'https://mediacare-production.up.railway.app';
+
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_URL || 'https://mediacare-production.up.railway.app';
 
