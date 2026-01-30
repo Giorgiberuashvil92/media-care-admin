@@ -106,6 +106,8 @@ export interface ShopProduct {
 class ApiService {
   private baseURL: string;
   private token: string | null = null;
+  private isRefreshing: boolean = false;
+  private refreshPromise: Promise<string | null> | null = null;
 
   constructor() {
     this.baseURL = API_BASE_URL;
@@ -131,20 +133,146 @@ class ApiService {
     if (typeof window !== 'undefined') {
       if (token) {
         localStorage.setItem('accessToken', token);
+        // Also update cookie
+        const isSecure = window.location.protocol === 'https:';
+        document.cookie = `accessToken=${token}; path=/; max-age=${7 * 24 * 60 * 60}; SameSite=Lax${isSecure ? '; Secure' : ''}`;
       } else {
         localStorage.removeItem('accessToken');
+        document.cookie = 'accessToken=; path=/; max-age=0';
       }
     }
   }
 
-  private async handleResponse<T>(response: Response): Promise<T> {
+  private async refreshToken(): Promise<string | null> {
+    // If already refreshing, return the existing promise
+    if (this.isRefreshing && this.refreshPromise) {
+      return this.refreshPromise;
+    }
+
+    this.isRefreshing = true;
+    this.refreshPromise = (async () => {
+      try {
+        const refreshToken = typeof window !== 'undefined' 
+          ? localStorage.getItem('refreshToken') 
+          : null;
+
+        if (!refreshToken) {
+          throw new Error('No refresh token available');
+        }
+
+        const response = await fetch(`${this.baseURL}/auth/refresh`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ refreshToken }),
+        });
+
+        if (!response.ok) {
+          throw new Error('Token refresh failed');
+        }
+
+        const data = await response.json();
+        
+        if (data.success && data.data?.token) {
+          this.setToken(data.data.token);
+          if (data.data.refreshToken) {
+            if (typeof window !== 'undefined') {
+              localStorage.setItem('refreshToken', data.data.refreshToken);
+            }
+          }
+          return data.data.token;
+        }
+
+        throw new Error('Invalid refresh response');
+      } catch (error) {
+        // Refresh failed, clear all tokens and redirect to login
+        this.setToken(null);
+        if (typeof window !== 'undefined') {
+          localStorage.removeItem('accessToken');
+          localStorage.removeItem('refreshToken');
+          localStorage.removeItem('user');
+          window.location.href = '/auth/sign-in';
+        }
+        return null;
+      } finally {
+        this.isRefreshing = false;
+        this.refreshPromise = null;
+      }
+    })();
+
+    return this.refreshPromise;
+  }
+
+  private async makeRequest<T>(
+    requestFn: () => Promise<Response>
+  ): Promise<T> {
+    const response = await requestFn();
+    
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
       const errorMessage =
         errorData.message || `HTTP error! status: ${response.status}`;
       
-      // If unauthorized (401), clear token and redirect to login
+      // If unauthorized (401), try to refresh token and retry
       if (response.status === 401) {
+        const newToken = await this.refreshToken();
+        
+        if (newToken) {
+          // Retry the original request with new token
+          const retryResponse = await requestFn();
+          if (retryResponse.ok) {
+            return retryResponse.json();
+          }
+        }
+        
+        // If refresh failed or retry failed, redirect to login
+        this.setToken(null);
+        if (typeof window !== 'undefined') {
+          localStorage.removeItem('accessToken');
+          localStorage.removeItem('refreshToken');
+          localStorage.removeItem('user');
+          window.location.href = '/auth/sign-in';
+        }
+      }
+      
+      throw new Error(errorMessage);
+    }
+    
+    return response.json();
+  }
+
+  private async handleResponse<T>(
+    response: Response,
+    originalRequest?: () => Promise<Response>
+  ): Promise<T> {
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      const errorMessage =
+        errorData.message || `HTTP error! status: ${response.status}`;
+      
+      // If unauthorized (401), try to refresh token
+      if (response.status === 401 && originalRequest) {
+        const newToken = await this.refreshToken();
+        
+        if (newToken) {
+          // Retry the original request with new token
+          const retryResponse = await originalRequest();
+          if (retryResponse.ok) {
+            return retryResponse.json();
+          }
+        }
+        
+        // If refresh failed or retry failed, redirect to login
+        this.setToken(null);
+        if (typeof window !== 'undefined') {
+          localStorage.removeItem('accessToken');
+          localStorage.removeItem('refreshToken');
+          localStorage.removeItem('user');
+          window.location.href = '/auth/sign-in';
+        }
+      } else if (response.status === 401) {
+        // No original request to retry, just redirect
         this.setToken(null);
         if (typeof window !== 'undefined') {
           localStorage.removeItem('accessToken');
@@ -171,6 +299,9 @@ class ApiService {
     
     if (data.data.token) {
       this.setToken(data.data.token);
+      if (data.data.refreshToken && typeof window !== 'undefined') {
+        localStorage.setItem('refreshToken', data.data.refreshToken);
+      }
     }
 
     return data;
@@ -210,7 +341,7 @@ class ApiService {
     if (params?.role) queryParams.append('role', params.role);
     if (params?.search) queryParams.append('search', params.search);
 
-    const response = await fetch(
+    const makeRequest = () => fetch(
       `${this.baseURL}/admin/users?${queryParams.toString()}`,
       {
         method: 'GET',
@@ -218,8 +349,11 @@ class ApiService {
       },
     );
 
+    const response = await makeRequest();
+
     return this.handleResponse<ApiResponse<{ users: User[]; pagination: any }>>(
       response,
+      makeRequest,
     );
   }
 
@@ -241,16 +375,14 @@ class ApiService {
     if (params?.search) queryParams.append('search', params.search);
     if (params?.status) queryParams.append('status', params.status);
 
-    const response = await fetch(
-      `${this.baseURL}/doctors?${queryParams.toString()}`,
-      {
-        method: 'GET',
-        headers: this.getHeaders(),
-      },
-    );
-
-    return this.handleResponse<ApiResponse<{ doctors: any[]; pagination: any }>>(
-      response,
+    return this.makeRequest<ApiResponse<{ doctors: any[]; pagination: any }>>(
+      () => fetch(
+        `${this.baseURL}/doctors?${queryParams.toString()}`,
+        {
+          method: 'GET',
+          headers: this.getHeaders(),
+        },
+      )
     );
   }
 
@@ -263,28 +395,28 @@ class ApiService {
       queryParams.append('includePending', 'true');
     }
 
-    const response = await fetch(
-      `${this.baseURL}/doctors/${id}?${queryParams.toString()}`,
-      {
-        method: 'GET',
-        headers: this.getHeaders(),
-      },
+    return this.makeRequest<ApiResponse<User>>(
+      () => fetch(
+        `${this.baseURL}/doctors/${id}?${queryParams.toString()}`,
+        {
+          method: 'GET',
+          headers: this.getHeaders(),
+        },
+      )
     );
-
-    return this.handleResponse<ApiResponse<User>>(response);
   }
 
   async updateDoctor(
     id: string,
     data: Partial<User>,
   ): Promise<ApiResponse<User>> {
-    const response = await fetch(`${this.baseURL}/doctors/${id}`, {
-      method: 'PUT',
-      headers: this.getHeaders(),
-      body: JSON.stringify(data),
-    });
-
-    return this.handleResponse<ApiResponse<User>>(response);
+    return this.makeRequest<ApiResponse<User>>(
+      () => fetch(`${this.baseURL}/doctors/${id}`, {
+        method: 'PUT',
+        headers: this.getHeaders(),
+        body: JSON.stringify(data),
+      })
+    );
   }
 
   async uploadLicenseDocument(
@@ -293,30 +425,31 @@ class ApiService {
     const formData = new FormData();
     formData.append('file', file);
 
-    const headers: HeadersInit = {};
-    if (this.token) {
-      headers['Authorization'] = `Bearer ${this.token}`;
-    }
-
-    const response = await fetch(`${this.baseURL}/upload/license`, {
-      method: 'POST',
-      headers,
-      body: formData,
-    });
-
-    return this.handleResponse<
+    return this.makeRequest<
       ApiResponse<{ filePath: string; fileName: string; fileSize: number; mimeType: string }>
-    >(response);
+    >(
+      () => {
+        const headers: HeadersInit = {};
+        if (this.token) {
+          headers['Authorization'] = `Bearer ${this.token}`;
+        }
+        return fetch(`${this.baseURL}/upload/license`, {
+          method: 'POST',
+          headers,
+          body: formData,
+        });
+      }
+    );
   }
 
   // Stats endpoint
   async getStats(): Promise<ApiResponse<any>> {
-    const response = await fetch(`${this.baseURL}/admin/stats`, {
-      method: 'GET',
-      headers: this.getHeaders(),
-    });
-
-    return this.handleResponse<ApiResponse<any>>(response);
+    return this.makeRequest<ApiResponse<any>>(
+      () => fetch(`${this.baseURL}/admin/stats`, {
+        method: 'GET',
+        headers: this.getHeaders(),
+      })
+    );
   }
 
   // Specializations endpoints
@@ -337,35 +470,33 @@ class ApiService {
     if (params?.search) queryParams.append('search', params.search);
     if (params?.status) queryParams.append('status', params.status);
 
-    const response = await fetch(
-      `${this.baseURL}/specializations?${queryParams.toString()}`,
-      {
-        method: 'GET',
-        headers: this.getHeaders(),
-      },
-    );
-
-    return this.handleResponse<ApiResponse<{ doctors: any[]; pagination: any }>>(
-      response,
+    return this.makeRequest<ApiResponse<{ doctors: any[]; pagination: any }>>(
+      () => fetch(
+        `${this.baseURL}/specializations?${queryParams.toString()}`,
+        {
+          method: 'GET',
+          headers: this.getHeaders(),
+        },
+      )
     );
   }
 
   async getPublicSpecializations(): Promise<ApiResponse<Specialization[]>> {
-    const response = await fetch(`${this.baseURL}/specializations`, {
-      method: 'GET',
-      headers: this.getHeaders(),
-    });
-
-    return this.handleResponse<ApiResponse<Specialization[]>>(response);
+    return this.makeRequest<ApiResponse<Specialization[]>>(
+      () => fetch(`${this.baseURL}/specializations`, {
+        method: 'GET',
+        headers: this.getHeaders(),
+      })
+    );
   }
 
   async getSpecializationsAdmin(): Promise<ApiResponse<Specialization[]>> {
-    const response = await fetch(`${this.baseURL}/specializations/admin`, {
-      method: 'GET',
-      headers: this.getHeaders(),
-    });
-
-    return this.handleResponse<ApiResponse<Specialization[]>>(response);
+    return this.makeRequest<ApiResponse<Specialization[]>>(
+      () => fetch(`${this.baseURL}/specializations/admin`, {
+        method: 'GET',
+        headers: this.getHeaders(),
+      })
+    );
   }
 
   async createSpecialization(data: {
@@ -374,50 +505,50 @@ class ApiService {
     isActive?: boolean;
     symptoms?: string[];
   }): Promise<ApiResponse<Specialization>> {
-    const response = await fetch(`${this.baseURL}/specializations`, {
-      method: 'POST',
-      headers: this.getHeaders(),
-      body: JSON.stringify(data),
-    });
-
-    return this.handleResponse<ApiResponse<Specialization>>(response);
+    return this.makeRequest<ApiResponse<Specialization>>(
+      () => fetch(`${this.baseURL}/specializations`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify(data),
+      })
+    );
   }
 
   async toggleSpecialization(
     id: string,
     isActive: boolean,
   ): Promise<ApiResponse<Specialization>> {
-    const response = await fetch(
-      `${this.baseURL}/specializations/${id}/toggle?isActive=${isActive}`,
-      {
-        method: 'PATCH',
-        headers: this.getHeaders(),
-      },
+    return this.makeRequest<ApiResponse<Specialization>>(
+      () => fetch(
+        `${this.baseURL}/specializations/${id}/toggle?isActive=${isActive}`,
+        {
+          method: 'PATCH',
+          headers: this.getHeaders(),
+        },
+      )
     );
-
-    return this.handleResponse<ApiResponse<Specialization>>(response);
   }
 
   async updateSpecialization(
     id: string,
     data: { name?: string; description?: string; isActive?: boolean; symptoms?: string[] },
   ): Promise<ApiResponse<Specialization>> {
-    const response = await fetch(`${this.baseURL}/specializations/${id}`, {
-      method: 'PATCH',
-      headers: this.getHeaders(),
-      body: JSON.stringify(data),
-    });
-
-    return this.handleResponse<ApiResponse<Specialization>>(response);
+    return this.makeRequest<ApiResponse<Specialization>>(
+      () => fetch(`${this.baseURL}/specializations/${id}`, {
+        method: 'PATCH',
+        headers: this.getHeaders(),
+        body: JSON.stringify(data),
+      })
+    );
   }
 
   async deleteSpecialization(id: string): Promise<ApiResponse<null>> {
-    const response = await fetch(`${this.baseURL}/specializations/${id}`, {
-      method: 'DELETE',
-      headers: this.getHeaders(),
-    });
-
-    return this.handleResponse<ApiResponse<null>>(response);
+    return this.makeRequest<ApiResponse<null>>(
+      () => fetch(`${this.baseURL}/specializations/${id}`, {
+        method: 'DELETE',
+        headers: this.getHeaders(),
+      })
+    );
   }
 
   // Medicine shop endpoints
@@ -437,15 +568,15 @@ class ApiService {
     if (params?.includeProducts)
       queryParams.append('includeProducts', String(params.includeProducts));
 
-    const response = await fetch(
-      `${this.baseURL}/shop/categories?${queryParams.toString()}`,
-      {
-        method: 'GET',
-        headers: this.getHeaders(),
-      },
+    return this.makeRequest<ApiResponse<ShopCategory[]>>(
+      () => fetch(
+        `${this.baseURL}/shop/categories?${queryParams.toString()}`,
+        {
+          method: 'GET',
+          headers: this.getHeaders(),
+        },
+      )
     );
-
-    return this.handleResponse<ApiResponse<ShopCategory[]>>(response);
   }
 
   async createShopCategory(
@@ -462,41 +593,41 @@ class ApiService {
         >
       >,
   ): Promise<ApiResponse<ShopCategory>> {
-    const response = await fetch(`${this.baseURL}/admin/shop/categories`, {
-      method: 'POST',
-      headers: this.getHeaders(),
-      body: JSON.stringify(data),
-    });
-
-    return this.handleResponse<ApiResponse<ShopCategory>>(response);
+    return this.makeRequest<ApiResponse<ShopCategory>>(
+      () => fetch(`${this.baseURL}/admin/shop/categories`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify(data),
+      })
+    );
   }
 
   async updateShopCategory(
     id: string,
     data: Partial<ShopCategory>,
   ): Promise<ApiResponse<ShopCategory>> {
-    const response = await fetch(
-      `${this.baseURL}/admin/shop/categories/${id}`,
-      {
-        method: 'PATCH',
-        headers: this.getHeaders(),
-        body: JSON.stringify(data),
-      },
+    return this.makeRequest<ApiResponse<ShopCategory>>(
+      () => fetch(
+        `${this.baseURL}/admin/shop/categories/${id}`,
+        {
+          method: 'PATCH',
+          headers: this.getHeaders(),
+          body: JSON.stringify(data),
+        },
+      )
     );
-
-    return this.handleResponse<ApiResponse<ShopCategory>>(response);
   }
 
   async deleteShopCategory(id: string): Promise<ApiResponse<{ message: string }>> {
-    const response = await fetch(
-      `${this.baseURL}/admin/shop/categories/${id}`,
-      {
-        method: 'DELETE',
-        headers: this.getHeaders(),
-      },
+    return this.makeRequest<ApiResponse<{ message: string }>>(
+      () => fetch(
+        `${this.baseURL}/admin/shop/categories/${id}`,
+        {
+          method: 'DELETE',
+          headers: this.getHeaders(),
+        },
+      )
     );
-
-    return this.handleResponse<ApiResponse<{ message: string }>>(response);
   }
 
   async getShopProducts(params?: {
@@ -521,20 +652,20 @@ class ApiService {
     if (params?.page) queryParams.append('page', params.page.toString());
     if (params?.limit) queryParams.append('limit', params.limit.toString());
 
-    const response = await fetch(
-      `${this.baseURL}/shop/products?${queryParams.toString()}`,
-      {
-        method: 'GET',
-        headers: this.getHeaders(),
-      },
-    );
-
-    return this.handleResponse<
+    return this.makeRequest<
       ApiResponse<{
         items: ShopProduct[];
         pagination: { page: number; limit: number; total: number; totalPages: number };
       }>
-    >(response);
+    >(
+      () => fetch(
+        `${this.baseURL}/shop/products?${queryParams.toString()}`,
+        {
+          method: 'GET',
+          headers: this.getHeaders(),
+        },
+      )
+    );
   }
 
   async createShopProduct(
@@ -557,35 +688,35 @@ class ApiService {
         >
       >,
   ): Promise<ApiResponse<ShopProduct>> {
-    const response = await fetch(`${this.baseURL}/admin/shop/products`, {
-      method: 'POST',
-      headers: this.getHeaders(),
-      body: JSON.stringify(data),
-    });
-
-    return this.handleResponse<ApiResponse<ShopProduct>>(response);
+    return this.makeRequest<ApiResponse<ShopProduct>>(
+      () => fetch(`${this.baseURL}/admin/shop/products`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: JSON.stringify(data),
+      })
+    );
   }
 
   async updateShopProduct(
     id: string,
     data: Partial<ShopProduct>,
   ): Promise<ApiResponse<ShopProduct>> {
-    const response = await fetch(`${this.baseURL}/admin/shop/products/${id}`, {
-      method: 'PATCH',
-      headers: this.getHeaders(),
-      body: JSON.stringify(data),
-    });
-
-    return this.handleResponse<ApiResponse<ShopProduct>>(response);
+    return this.makeRequest<ApiResponse<ShopProduct>>(
+      () => fetch(`${this.baseURL}/admin/shop/products/${id}`, {
+        method: 'PATCH',
+        headers: this.getHeaders(),
+        body: JSON.stringify(data),
+      })
+    );
   }
 
   async deleteShopProduct(id: string): Promise<ApiResponse<{ message: string }>> {
-    const response = await fetch(`${this.baseURL}/admin/shop/products/${id}`, {
-      method: 'DELETE',
-      headers: this.getHeaders(),
-    });
-
-    return this.handleResponse<ApiResponse<{ message: string }>>(response);
+    return this.makeRequest<ApiResponse<{ message: string }>>(
+      () => fetch(`${this.baseURL}/admin/shop/products/${id}`, {
+        method: 'DELETE',
+        headers: this.getHeaders(),
+      })
+    );
   }
 
   // Create super admin (public endpoint for initial setup)
@@ -624,12 +755,7 @@ class ApiService {
     if (params.paymentStatus && params.paymentStatus !== 'all') queryParams.append('paymentStatus', params.paymentStatus);
     if (params.search) queryParams.append('search', params.search);
 
-    const response = await fetch(`${this.baseURL}/admin/appointments?${queryParams.toString()}`, {
-      method: 'GET',
-      headers: this.getHeaders(),
-    });
-
-    return this.handleResponse<ApiResponse<{
+    return this.makeRequest<ApiResponse<{
       appointments: any[];
       pagination: {
         page: number;
@@ -637,17 +763,22 @@ class ApiService {
         total: number;
         totalPages: number;
       };
-    }>>(response);
+    }>>(
+      () => fetch(`${this.baseURL}/admin/appointments?${queryParams.toString()}`, {
+        method: 'GET',
+        headers: this.getHeaders(),
+      })
+    );
   }
 
   async updateAppointmentStatus(appointmentId: string, status: string): Promise<ApiResponse<any>> {
-    const response = await fetch(`${this.baseURL}/admin/appointments/${appointmentId}/status`, {
-      method: 'PUT',
-      headers: this.getHeaders(),
-      body: JSON.stringify({ status }),
-    });
-
-    return this.handleResponse<ApiResponse<any>>(response);
+    return this.makeRequest<ApiResponse<any>>(
+      () => fetch(`${this.baseURL}/admin/appointments/${appointmentId}/status`, {
+        method: 'PUT',
+        headers: this.getHeaders(),
+        body: JSON.stringify({ status }),
+      })
+    );
   }
 
   async updateDoctorApproval(
@@ -655,13 +786,13 @@ class ApiService {
     approvalStatus: 'pending' | 'approved' | 'rejected', 
     isActive?: boolean
   ): Promise<ApiResponse<any>> {
-    const response = await fetch(`${this.baseURL}/admin/doctors/${doctorId}/approval`, {
-      method: 'PUT',
-      headers: this.getHeaders(),
-      body: JSON.stringify({ approvalStatus, isActive }),
-    });
-
-    return this.handleResponse<ApiResponse<any>>(response);
+    return this.makeRequest<ApiResponse<any>>(
+      () => fetch(`${this.baseURL}/admin/doctors/${doctorId}/approval`, {
+        method: 'PUT',
+        headers: this.getHeaders(),
+        body: JSON.stringify({ approvalStatus, isActive }),
+      })
+    );
   }
 
   // Generic API call
@@ -669,15 +800,15 @@ class ApiService {
     endpoint: string,
     options: RequestInit = {},
   ): Promise<ApiResponse<T>> {
-    const response = await fetch(`${this.baseURL}${endpoint}`, {
-      ...options,
-      headers: {
-        ...this.getHeaders(),
-        ...options.headers,
-      },
-    });
-
-    return this.handleResponse<ApiResponse<T>>(response);
+    return this.makeRequest<ApiResponse<T>>(
+      () => fetch(`${this.baseURL}${endpoint}`, {
+        ...options,
+        headers: {
+          ...this.getHeaders(),
+          ...options.headers,
+        },
+      })
+    );
   }
 }
 
